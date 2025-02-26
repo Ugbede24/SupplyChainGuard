@@ -1,4 +1,4 @@
-;; Supply Chain Verification Contract 
+;; Supply Chain Verification Contract - Version 3.0
 
 (define-data-var shipment-counter uint u0)
 (define-map shipment-contracts
@@ -13,14 +13,16 @@
         retailer-verified: bool,
         inspector-verified: bool,
         quality-dispute: bool,
-        delivery-deadline: uint
+        delivery-deadline: uint,
+        product-signature: (optional (buff 32)),
+        shipping-timestamp: (optional uint)
     }
 )
 
 ;; Define quality inspector with proper principal format
 (define-constant inspector 'SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7)
 
-(define-public (create-shipment (manufacturer principal) (retailer principal) (value uint) (deadline uint))
+(define-public (create-shipment (manufacturer principal) (retailer principal) (value uint) (deadline uint) (prod-sig (optional (buff 32))) (timestamp (optional uint)))
     (begin
         ;; Validate basic inputs
         (if (or (is-eq manufacturer retailer) 
@@ -32,22 +34,38 @@
             (if (not (is-eq manufacturer tx-sender))
                 (err "Only the manufacturer can initiate the shipment.")
                 
-                ;; Create the shipment contract
-                (begin
-                    (map-set shipment-contracts 
-                        { id: (var-get shipment-counter) }
-                        { manufacturer: manufacturer, 
-                          retailer: retailer, 
-                          value: value, 
-                          is-active: true, 
-                          is-shipped: false, 
-                          manufacturer-verified: false, 
-                          retailer-verified: false, 
-                          inspector-verified: false, 
-                          quality-dispute: false, 
-                          delivery-deadline: deadline })
-                    (var-set shipment-counter (+ (var-get shipment-counter) u1))
-                    (ok (- (var-get shipment-counter) u1))
+                ;; Validate product signature and timestamp
+                (let (
+                    (validated-timestamp (if (is-some timestamp)
+                                        (if (> (unwrap-panic timestamp) block-height)
+                                            timestamp
+                                            none)
+                                        none))
+                    (validated-signature (if (is-some prod-sig)
+                                    (if (is-eq (len (unwrap-panic prod-sig)) u32)
+                                        prod-sig
+                                        none)
+                                    none))
+                )
+                    ;; Create the shipment contract
+                    (begin
+                        (map-set shipment-contracts 
+                            { id: (var-get shipment-counter) }
+                            { manufacturer: manufacturer, 
+                              retailer: retailer, 
+                              value: value, 
+                              is-active: true, 
+                              is-shipped: false, 
+                              manufacturer-verified: false, 
+                              retailer-verified: false, 
+                              inspector-verified: false, 
+                              quality-dispute: false, 
+                              delivery-deadline: deadline, 
+                              product-signature: validated-signature, 
+                              shipping-timestamp: validated-timestamp })
+                        (var-set shipment-counter (+ (var-get shipment-counter) u1))
+                        (ok (- (var-get shipment-counter) u1))
+                    )
                 )
             )
         )
@@ -118,34 +136,6 @@
                                 (err "Only the manufacturer, retailer, or inspector can verify the shipment.")
                             )
                         )
-                    )
-                )
-                (err "Shipment contract not found.")
-            )
-        )
-    )
-)
-
-(define-public (mark-shipped (shipment-id uint))
-    (if (>= shipment-id (var-get shipment-counter))
-        (err "Invalid shipment ID.")
-        (let
-            (
-                (shipment (map-get? shipment-contracts { id: shipment-id }))
-            )
-            (match shipment
-                shipment-data
-                (let
-                    (
-                        (manufacturer (get manufacturer shipment-data))
-                    )
-                    (if (is-eq tx-sender manufacturer)
-                        (begin
-                            (map-set shipment-contracts { id: shipment-id }
-                                     (merge shipment-data { is-shipped: true }))
-                            (ok "Shipment marked as shipped.")
-                        )
-                        (err "Only the manufacturer can mark the shipment as shipped.")
                     )
                 )
                 (err "Shipment contract not found.")
@@ -309,6 +299,61 @@
                             )
                         )
                         (err "Only the manufacturer can cancel an active shipment.")
+                    )
+                )
+                (err "Shipment contract not found.")
+            )
+        )
+    )
+)
+
+(define-public (verify-product (shipment-id uint) (prod-sig (buff 32)))
+    (if (>= shipment-id (var-get shipment-counter))
+        (err "Invalid shipment ID.")
+        (let
+            (
+                (shipment (map-get? shipment-contracts { id: shipment-id }))
+            )
+            (match shipment
+                shipment-data
+                (let
+                    (
+                        (stored-signature (get product-signature shipment-data))
+                    )
+                    (if (is-some stored-signature)
+                        (if (is-eq (default-to 0x0000000000000000000000000000000000000000000000000000000000000000 stored-signature) prod-sig)
+                            (ok "Product signature matches.")
+                            (err "Product signature does not match.")
+                        )
+                        (err "No product signature stored for this shipment.")
+                    )
+                )
+                (err "Shipment contract not found.")
+            )
+        )
+    )
+)
+
+(define-public (add-product-signature (shipment-id uint) (prod-sig (buff 32)) (timestamp uint))
+    (if (>= shipment-id (var-get shipment-counter))
+        (err "Invalid shipment ID.")
+        (let
+            (
+                (shipment (map-get? shipment-contracts { id: shipment-id }))
+            )
+            (match shipment
+                shipment-data
+                (let
+                    (
+                        (manufacturer (get manufacturer shipment-data))
+                    )
+                    (if (is-eq tx-sender manufacturer)
+                        (begin
+                            (map-set shipment-contracts { id: shipment-id }
+                                     (merge shipment-data { product-signature: (some prod-sig), shipping-timestamp: (some timestamp) }))
+                            (ok "Product signature and timestamp added successfully.")
+                        )
+                        (err "Only the manufacturer can add a product signature.")
                     )
                 )
                 (err "Shipment contract not found.")
