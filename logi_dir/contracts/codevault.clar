@@ -8,11 +8,17 @@
         retailer: principal,
         value: uint,
         is-active: bool,
+        is-shipped: bool,
         manufacturer-verified: bool,
         retailer-verified: bool,
+        inspector-verified: bool,
+        quality-dispute: bool,
         delivery-deadline: uint
     }
 )
+
+;; Define quality inspector with proper principal format
+(define-constant inspector 'SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7)
 
 (define-public (create-shipment (manufacturer principal) (retailer principal) (value uint) (deadline uint))
     (begin
@@ -34,12 +40,44 @@
                           retailer: retailer, 
                           value: value, 
                           is-active: true, 
+                          is-shipped: false, 
                           manufacturer-verified: false, 
                           retailer-verified: false, 
+                          inspector-verified: false, 
+                          quality-dispute: false, 
                           delivery-deadline: deadline })
                     (var-set shipment-counter (+ (var-get shipment-counter) u1))
                     (ok (- (var-get shipment-counter) u1))
                 )
+            )
+        )
+    )
+)
+
+(define-public (report-quality-issue (shipment-id uint))
+    (if (>= shipment-id (var-get shipment-counter))
+        (err "Invalid shipment ID.")
+        (let
+            (
+                (shipment (map-get? shipment-contracts { id: shipment-id }))
+            )
+            (match shipment
+                shipment-data
+                (let
+                    (
+                        (manufacturer (get manufacturer shipment-data))
+                        (retailer (get retailer shipment-data))
+                    )
+                    (if (or (is-eq tx-sender manufacturer) (is-eq tx-sender retailer))
+                        (begin
+                            (map-set shipment-contracts { id: shipment-id }
+                                     (merge shipment-data { quality-dispute: true }))
+                            (ok "Quality issue has been reported.")
+                        )
+                        (err "Only the manufacturer or retailer can report quality issues.")
+                    )
+                )
+                (err "Shipment contract not found.")
             )
         )
     )
@@ -71,8 +109,43 @@
                                          (merge shipment-data { retailer-verified: true }))
                                 (ok "Retailer has verified the shipment.")
                             )
-                            (err "Only the manufacturer or retailer can verify the shipment.")
+                            (if (is-eq tx-sender inspector)
+                                (begin
+                                    (map-set shipment-contracts { id: shipment-id }
+                                             (merge shipment-data { inspector-verified: true }))
+                                    (ok "Inspector has verified the shipment.")
+                                )
+                                (err "Only the manufacturer, retailer, or inspector can verify the shipment.")
+                            )
                         )
+                    )
+                )
+                (err "Shipment contract not found.")
+            )
+        )
+    )
+)
+
+(define-public (mark-shipped (shipment-id uint))
+    (if (>= shipment-id (var-get shipment-counter))
+        (err "Invalid shipment ID.")
+        (let
+            (
+                (shipment (map-get? shipment-contracts { id: shipment-id }))
+            )
+            (match shipment
+                shipment-data
+                (let
+                    (
+                        (manufacturer (get manufacturer shipment-data))
+                    )
+                    (if (is-eq tx-sender manufacturer)
+                        (begin
+                            (map-set shipment-contracts { id: shipment-id }
+                                     (merge shipment-data { is-shipped: true }))
+                            (ok "Shipment marked as shipped.")
+                        )
+                        (err "Only the manufacturer can mark the shipment as shipped.")
                     )
                 )
                 (err "Shipment contract not found.")
@@ -92,6 +165,8 @@
                 shipment-data
                 (if (and (is-eq (get manufacturer-verified shipment-data) true)
                          (is-eq (get retailer-verified shipment-data) true)
+                         (or (is-eq (get inspector-verified shipment-data) true)
+                             (is-eq (get quality-dispute shipment-data) false))
                          (is-eq (get is-active shipment-data) true))
                     (let
                         (
@@ -107,10 +182,56 @@
                             (err "STX transfer failed.")
                         )
                     )
-                    (err "Both parties must verify before completing transaction.")
+                    (err "All parties must verify before completing transaction.")
                 )
                 (err "Shipment contract not found.")
             )
+        )
+    )
+)
+
+(define-public (resolve-quality-issue (shipment-id uint) (pay-retailer bool))
+    (if (>= shipment-id (var-get shipment-counter))
+        (err "Invalid shipment ID.")
+        (if (is-eq tx-sender inspector)
+            (let
+                (
+                    (shipment (map-get? shipment-contracts { id: shipment-id }))
+                )
+                (match shipment
+                    shipment-data
+                    (if (is-eq (get quality-dispute shipment-data) true)
+                        (let
+                            (
+                                (manufacturer (get manufacturer shipment-data))
+                                (retailer (get retailer shipment-data))
+                                (value (get value shipment-data))
+                            )
+                            (if pay-retailer
+                                (if (is-ok (stx-transfer? value tx-sender retailer))
+                                    (begin
+                                        (map-set shipment-contracts { id: shipment-id }
+                                                 (merge shipment-data { is-active: false }))
+                                        (ok "Payment released to retailer.")
+                                    )
+                                    (err "STX transfer to retailer failed.")
+                                )
+                                (if (is-ok (stx-transfer? value tx-sender manufacturer))
+                                    (begin
+                                        (map-set shipment-contracts { id: shipment-id }
+                                                 (merge shipment-data { is-active: false }))
+                                        (ok "Payment returned to manufacturer.")
+                                    )
+                                    (err "STX transfer to manufacturer failed.")
+                                )
+                            )
+                        )
+                        (err "No quality issue has been reported for this shipment.")
+                    )
+                    (err "Shipment contract not found.")
+                )
+            )
+            (err "Only the inspector can resolve quality issues.")
         )
     )
 )
@@ -124,7 +245,8 @@
             )
             (match shipment
                 shipment-data
-                (if (and (is-eq (get is-active shipment-data) true)
+                (if (and (is-eq (get quality-dispute shipment-data) false)
+                         (is-eq (get is-active shipment-data) true)
                          (>= block-height (get delivery-deadline shipment-data)))
                     (let
                         (
@@ -161,12 +283,30 @@
                     (
                         (manufacturer (get manufacturer shipment-data))
                         (is-active (get is-active shipment-data))
+                        (is-shipped (get is-shipped shipment-data))
                     )
                     (if (and (is-eq tx-sender manufacturer) (is-eq is-active true))
                         (begin
-                            (map-set shipment-contracts { id: shipment-id }
-                                     (merge shipment-data { is-active: false }))
-                            (ok "Shipment successfully cancelled.")
+                            (if is-shipped
+                                (let
+                                    (
+                                        (value (get value shipment-data))
+                                    )
+                                    (if (is-ok (stx-transfer? value tx-sender manufacturer))
+                                        (begin
+                                            (map-set shipment-contracts { id: shipment-id }
+                                                     (merge shipment-data { is-active: false }))
+                                            (ok "Shipment successfully cancelled, payment returned to manufacturer.")
+                                        )
+                                        (err "STX transfer failed.")
+                                    )
+                                )
+                                (begin
+                                    (map-set shipment-contracts { id: shipment-id }
+                                             (merge shipment-data { is-active: false }))
+                                    (ok "Shipment successfully cancelled.")
+                                )
+                            )
                         )
                         (err "Only the manufacturer can cancel an active shipment.")
                     )
